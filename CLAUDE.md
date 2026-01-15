@@ -109,7 +109,20 @@ Examples:
 ### Authentication Flow
 - OAuth token passed as `Zoho-oauthtoken {token}` header
 - Token validation happens on first API call
-- No automatic token refresh (must be done externally)
+- Automatic token refresh using refresh token when access token expires or returns 401
+
+### Required OAuth Scopes
+The following scopes are required for full functionality:
+- `ZohoProjects.portals.ALL` - Portal operations
+- `ZohoProjects.projects.ALL` - Project CRUD
+- `ZohoProjects.tasks.ALL` - Task CRUD
+- `ZohoProjects.tasklists.ALL` - Task list CRUD
+- `ZohoProjects.bugs.ALL` - Issue/bug CRUD
+- `ZohoProjects.milestones.ALL` - Milestone/phase CRUD
+- `ZohoProjects.users.READ` - User listing
+- `ZohoProjects.documents.ALL` - **Required for inline image downloads**
+- `ZohoSearch.securesearch.READ` - Search functionality
+- `ZohoPC.files.ALL` - File attachments
 
 ## Key Implementation Details
 
@@ -118,3 +131,28 @@ Examples:
 - **Pagination**: Supported on list operations with page/per_page params
 - **Optional project scoping**: Some operations (tasks, issues, users) work at portal or project level
 - **Delete behavior**: Projects use trash endpoint, tasks/issues use DELETE
+
+## Inline Image Downloads
+
+The `download_inline_image` tool allows downloading images embedded in task comments.
+
+### How it works
+1. Task comments contain inline images as `<img>` tags with `src` pointing to `https://projects.zoho.com/viewInlineAttachment/image?file=...`
+2. The tool converts this URL to the API-accessible endpoint: `viewInlineAttachmentForApi`
+3. Uses OAuth token authentication (requires `ZohoProjects.documents.ALL` scope)
+4. Returns the image as base64-encoded data with proper MIME type
+
+### Usage
+```
+Tool: download_inline_image
+Parameters:
+  image_url: "https://projects.zoho.com/viewInlineAttachment/image?file=projects-..."
+```
+
+### Extracting image URLs from comments
+When fetching task comments via `list_task_comments`, look for `<img>` tags in the `comment` field:
+```html
+<img src="https://projects.zoho.com/viewInlineAttachment/image?file=projects-abc123..." width="400" height="300">
+```
+
+Extract the `src` attribute value and pass it to `download_inline_image`.
