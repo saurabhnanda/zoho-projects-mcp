@@ -111,7 +111,8 @@ class ZohoProjectsServer {
     endpoint: string,
     method: string = "GET",
     body?: any,
-    isRetry: boolean = false
+    isRetry: boolean = false,
+    useRestApi: boolean = false
   ): Promise<any> {
     // Check if token needs refresh (5 minutes before expiry)
     if (Date.now() >= this.tokenExpiresAt) {
@@ -125,7 +126,11 @@ class ZohoProjectsServer {
       );
     }
 
-    const url = `${this.baseUrl}${endpoint}`;
+    // Use REST API (v1/v2) or v3 API based on flag
+    const baseUrl = useRestApi
+      ? `${this.config.apiDomain}/restapi`
+      : this.baseUrl;
+    const url = `${baseUrl}${endpoint}`;
     const headers: Record<string, string> = {
       Authorization: `Zoho-oauthtoken ${this.config.accessToken}`,
       "Content-Type": "application/json",
@@ -512,10 +517,12 @@ class ZohoProjectsServer {
                   "all",
                   "projects",
                   "tasks",
+                  "tasklists",
                   "issues",
                   "milestones",
                   "forums",
                   "events",
+                  "status",
                 ],
               },
               page: { type: "number", description: "Page number", default: 1 },
@@ -547,14 +554,14 @@ class ZohoProjectsServer {
         // Task Lists
         {
           name: "list_tasklists",
-          description: "List all task lists in a project. Use name_contains to filter by name and avoid huge responses.",
+          description: "List all task lists in a project. Use name_contains to filter by name. For finding a specific tasklist, prefer search(module=tasklists) which is more efficient.",
           inputSchema: {
             type: "object",
             properties: {
               project_id: { type: "string", description: "Project ID" },
               name_contains: {
                 type: "string",
-                description: "Filter tasklists where name contains this string (server-side filter via Zoho API). RECOMMENDED to avoid huge responses."
+                description: "Filter tasklists where name contains this string (client-side filter). For server-side search, use search(module=tasklists) instead."
               },
               minimal: {
                 type: "boolean",
@@ -638,27 +645,27 @@ class ZohoProjectsServer {
         },
         {
           name: "create_task_comment",
-          description: "Add a comment to a task",
+          description: "Add a comment to a task. IMPORTANT: Use actual HTML tags (<b>, <ul>, <li>, etc.), NOT escaped entities (&lt;b&gt;). Zoho renders HTML directly.",
           inputSchema: {
             type: "object",
             properties: {
               project_id: { type: "string", description: "Project ID" },
               task_id: { type: "string", description: "Task ID" },
-              content: { type: "string", description: "Comment content (can include HTML)" },
+              content: { type: "string", description: "Comment content. Use raw HTML tags (e.g., <b>bold</b>, <ul><li>item</li></ul>). Do NOT escape as &lt;b&gt; - that will display literally." },
             },
             required: ["project_id", "task_id", "content"],
           },
         },
         {
           name: "update_task_comment",
-          description: "Update a comment on a task",
+          description: "Update a comment on a task. IMPORTANT: Use actual HTML tags, NOT escaped entities.",
           inputSchema: {
             type: "object",
             properties: {
               project_id: { type: "string", description: "Project ID" },
               task_id: { type: "string", description: "Task ID" },
               comment_id: { type: "string", description: "Comment ID" },
-              content: { type: "string", description: "Updated comment content" },
+              content: { type: "string", description: "Updated comment content. Use raw HTML tags (e.g., <b>bold</b>), not escaped entities." },
             },
             required: ["project_id", "task_id", "comment_id", "content"],
           },
@@ -723,14 +730,14 @@ class ZohoProjectsServer {
         // Comment Attachment Download
         {
           name: "download_comment_attachment",
-          description: "Download an attachment from a task comment. Use the attachment_id from the 'attachments' array in task comments. Returns the file as base64-encoded data.",
+          description: "Download an attachment from a task comment. PREFERRED: Use download_url from the attachment object (most reliable). FALLBACK: Use attachment_id if download_url not available. Returns the file as base64-encoded data.",
           inputSchema: {
             type: "object",
             properties: {
-              project_id: { type: "string", description: "Project ID" },
-              attachment_id: { type: "string", description: "Attachment ID from the comment's attachments array" },
+              project_id: { type: "string", description: "Project ID (required if using attachment_id)" },
+              attachment_id: { type: "string", description: "Attachment ID from the comment's attachments array (fallback method)" },
+              download_url: { type: "string", description: "Direct download URL from the attachment object (preferred method - use permanent_url, preview_url, or download_url field)" },
             },
-            required: ["project_id", "attachment_id"],
           },
         },
 
@@ -761,6 +768,19 @@ class ZohoProjectsServer {
               sort_by: {
                 type: "string",
                 description: "Sort criteria in format ASC(field) or DESC(field). Fields: last_modified_time, created_time. Example: DESC(last_modified_time)",
+              },
+              minimal: {
+                type: "boolean",
+                description: "Return minimal response (id, key, name, status, priority, has_comments, created_time, last_updated_time). Set to false for full response. Default: true",
+                default: true,
+              },
+              has_comments: {
+                type: "boolean",
+                description: "Filter to only tasks that have comments. Useful for monitoring bug reports.",
+              },
+              since: {
+                type: "string",
+                description: "Only return tasks created or modified after this ISO date (e.g., 2026-01-14T00:00:00Z). Useful for incremental checks.",
               },
             },
             required: ["project_id", "tasklist_id"],
@@ -869,7 +889,7 @@ class ZohoProjectsServer {
 
           // Comment Attachment Download
           case "download_comment_attachment":
-            return await this.downloadCommentAttachment(params.project_id, params.attachment_id);
+            return await this.downloadCommentAttachment(params.project_id, params.attachment_id, params.download_url);
 
           // Feeds
           case "list_feeds":
@@ -877,7 +897,7 @@ class ZohoProjectsServer {
 
           // Tasks in Tasklist
           case "list_tasks_in_tasklist":
-            return await this.listTasksInTasklist(params.project_id, params.tasklist_id, params.page, params.per_page, params.sort_by);
+            return await this.listTasksInTasklist(params.project_id, params.tasklist_id, params.page, params.per_page, params.sort_by, params.minimal, params.has_comments, params.since);
 
           default:
             throw new McpError(
@@ -1174,10 +1194,9 @@ class ZohoProjectsServer {
   private async listTasklists(projectId: string, nameContains?: string, minimal: boolean = true) {
     const url = `/portal/${this.config.portalId}/projects/${projectId}/tasklists`;
     const data = await this.makeRequest(url);
-
     let tasklists = data.tasklists || [];
 
-    // Filter by name if name_contains provided (client-side filter)
+    // Client-side filter by name if provided
     if (nameContains) {
       const searchLower = nameContains.toLowerCase();
       tasklists = tasklists.filter((t: any) =>
@@ -1197,7 +1216,7 @@ class ZohoProjectsServer {
     }
 
     return {
-      content: [{ type: "text", text: JSON.stringify({ ...data, tasklists }, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     };
   }
 
@@ -1461,7 +1480,7 @@ class ZohoProjectsServer {
   }
 
   // Comment Attachment Download
-  private async downloadCommentAttachment(projectId: string, attachmentId: string) {
+  private async downloadCommentAttachment(projectId?: string, attachmentId?: string, directDownloadUrl?: string) {
     // Ensure we have a valid access token
     if (Date.now() >= this.tokenExpiresAt) {
       await this.refreshAccessToken();
@@ -1475,38 +1494,67 @@ class ZohoProjectsServer {
     }
 
     try {
-      // First, get attachment details to find the download URL
-      const attachmentDetails = await this.makeRequest(
-        `/portal/${this.config.portalId}/projects/${projectId}/attachments/${attachmentId}`
-      );
+      let attachment: any = { name: 'attachment', type: 'application/octet-stream' };
+      let downloadUrl: string | null = directDownloadUrl || null;
 
-      // The attachment details should contain download info
-      const attachment = attachmentDetails.attachment?.[0] || attachmentDetails;
+      // If direct download URL provided, use it (preferred method)
+      if (downloadUrl) {
+        console.error(`Using direct download URL: ${downloadUrl.substring(0, 80)}...`);
+      } else if (projectId && attachmentId) {
+        // Fallback: Try to get download URL from API
 
-      // Try to get a download URL - Zoho provides various URL fields
-      let downloadUrl = attachment.permanent_url || attachment.preview_url || attachment.download_url;
-
-      if (!downloadUrl) {
-        // If no direct URL, construct the download endpoint
-        // Based on the API docs, we can use the third_party_file_id for WorkDrive files
-        const thirdPartyFileId = attachment.third_party_file_id;
-        if (thirdPartyFileId && attachment.app_domain === 'workdrive') {
-          // For WorkDrive files, use the WorkDrive download API
-          downloadUrl = `https://workdrive.zoho.com/api/v1/download/${thirdPartyFileId}`;
-        } else {
-          throw new McpError(
-            ErrorCode.InternalError,
-            `No download URL found for attachment. Details: ${JSON.stringify(attachment)}`
+        // Attempt 1: v3 API
+        try {
+          const attachmentDetails = await this.makeRequest(
+            `/portal/${this.config.portalId}/projects/${projectId}/attachments/${attachmentId}`
           );
+          attachment = attachmentDetails.attachment?.[0] || attachmentDetails;
+          downloadUrl = attachment.permanent_url || attachment.preview_url || attachment.download_url;
+        } catch (v3Error) {
+          console.error(`v3 API failed for attachment ${attachmentId}, trying REST API...`);
         }
+
+        // Attempt 2: REST API (older API, different endpoint structure)
+        if (!downloadUrl) {
+          try {
+            const restAttachmentDetails = await this.makeRequest(
+              `/portal/${this.config.portalId}/projects/${projectId}/documents/${attachmentId}/`,
+              "GET",
+              undefined,
+              false,
+              true  // useRestApi = true
+            );
+            attachment = restAttachmentDetails.documents?.[0] || restAttachmentDetails;
+            downloadUrl = attachment.permalink || attachment.download_url;
+          } catch (restError) {
+            console.error(`REST API also failed for attachment ${attachmentId}`);
+          }
+        }
+
+        // Attempt 3: Construct direct download URL using REST API pattern
+        if (!downloadUrl) {
+          // REST API direct download endpoint
+          downloadUrl = `${this.config.apiDomain}/restapi/portal/${this.config.portalId}/projects/${projectId}/documents/${attachmentId}/content/`;
+        }
+      } else {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          "Either download_url or both project_id and attachment_id must be provided"
+        );
       }
 
-      // Download the file
-      const response = await fetch(downloadUrl, {
+      // Download the file - try with OAuth token first, then without (for signed URLs)
+      let response = await fetch(downloadUrl, {
         headers: {
           Authorization: `Zoho-oauthtoken ${this.config.accessToken}`,
         },
       });
+
+      // If 401 with signed URL (download-accl.zoho.com), try without auth header
+      if (!response.ok && response.status === 401 && downloadUrl.includes('download-accl.zoho.com')) {
+        console.error("Trying download without auth header (signed URL)...");
+        response = await fetch(downloadUrl);
+      }
 
       if (!response.ok) {
         // Try token refresh on 401
@@ -1596,16 +1644,75 @@ class ZohoProjectsServer {
     };
   }
 
-  // Tasks in Tasklist
-  private async listTasksInTasklist(projectId: string, tasklistId: string, page: number = 1, perPage: number = 100, sortBy?: string) {
-    let queryParams = `page=${page}&per_page=${perPage}`;
+  // Tasks in Tasklist - uses REST API (v1/v2) since v3 doesn't support tasklist filtering
+  private async listTasksInTasklist(projectId: string, tasklistId: string, page: number = 1, perPage: number = 100, sortBy?: string, minimal: boolean = true, hasComments?: boolean, since?: string) {
+    // REST API uses 'index' and 'range' instead of 'page' and 'per_page'
+    const index = (page - 1) * perPage + 1;
+    let queryParams = `index=${index}&range=${perPage}`;
     if (sortBy) queryParams += `&sort_by=${encodeURIComponent(sortBy)}`;
 
     const data = await this.makeRequest(
-      `/portal/${this.config.portalId}/projects/${projectId}/tasklists/${tasklistId}/tasks?${queryParams}`
+      `/portal/${this.config.portalId}/projects/${projectId}/tasklists/${tasklistId}/tasks/?${queryParams}`,
+      "GET",
+      undefined,
+      false,
+      true  // useRestApi = true
     );
+
+    let tasks = data.tasks || [];
+
+    // Filter by since timestamp (checks both created and last_updated)
+    if (since) {
+      const sinceDate = new Date(since).getTime();
+      tasks = tasks.filter((t: any) => {
+        const createdTime = t.created_time_long || 0;
+        const updatedTime = t.last_updated_time_long || 0;
+        return createdTime > sinceDate || updatedTime > sinceDate;
+      });
+    }
+
+    // Filter by has_comments if specified
+    if (hasComments !== undefined) {
+      tasks = tasks.filter((t: any) => (t.is_comment_added || false) === hasComments);
+    }
+
+    // Return minimal format by default
+    if (minimal) {
+      const minimalTasks = tasks.map((t: any) => ({
+        id: t.id_string || t.id?.toString(),
+        key: t.key,
+        name: t.name,
+        status: t.status?.name,
+        priority: t.priority,
+        has_comments: t.is_comment_added || false,
+        created_time: t.created_time_format,
+        last_updated_time: t.last_updated_time_format,
+      }));
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          page_info: {
+            page,
+            per_page: perPage,
+            count: minimalTasks.length,
+            has_next_page: data.tasks?.length === perPage
+          },
+          tasks: minimalTasks
+        }, null, 2) }],
+      };
+    }
+
+    // Return full response
     return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify({
+        page_info: {
+          page,
+          per_page: perPage,
+          count: tasks.length,
+          has_next_page: data.tasks?.length === perPage
+        },
+        tasks: tasks
+      }, null, 2) }],
     };
   }
 
