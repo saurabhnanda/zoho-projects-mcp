@@ -624,7 +624,7 @@ class ZohoProjectsServer {
         // Task Comments
         {
           name: "list_task_comments",
-          description: "List all comments on a task",
+          description: "List all comments on a task. Even with minimal=true, attachment IDs are included so you can call download_comment_attachment if needed.",
           inputSchema: {
             type: "object",
             properties: {
@@ -632,7 +632,7 @@ class ZohoProjectsServer {
               task_id: { type: "string", description: "Task ID" },
               minimal: {
                 type: "boolean",
-                description: "Return minimal response (id, created_time, author, comment, attachments[{id,name,type}]). Set to false for full response. Default: true",
+                description: "Return minimal response (id, created_time, author, comment, attachments[{id,name,type}]). Includes enough info to fetch attachments via download_comment_attachment. Set to false for full response. Default: true",
                 default: true
               },
               since: {
@@ -652,6 +652,11 @@ class ZohoProjectsServer {
               project_id: { type: "string", description: "Project ID" },
               task_id: { type: "string", description: "Task ID" },
               content: { type: "string", description: "Comment content. Use raw HTML tags (e.g., <b>bold</b>, <ul><li>item</li></ul>). Do NOT escape as &lt;b&gt; - that will display literally." },
+              minimal: {
+                type: "boolean",
+                description: "Return minimal response (id, created_time only). Default: true",
+                default: true
+              },
             },
             required: ["project_id", "task_id", "content"],
           },
@@ -871,7 +876,7 @@ class ZohoProjectsServer {
               params.since
             );
           case "create_task_comment":
-            return await this.createTaskComment(params);
+            return await this.createTaskComment(params, params.minimal !== false);
           case "update_task_comment":
             return await this.updateTaskComment(params);
           case "delete_task_comment":
@@ -1316,13 +1321,31 @@ class ZohoProjectsServer {
     };
   }
 
-  private async createTaskComment(params: any) {
+  private async createTaskComment(params: any, minimal: boolean = true) {
     const { project_id, task_id, content } = params;
     const data = await this.makeRequest(
       `/portal/${this.config.portalId}/projects/${project_id}/tasks/${task_id}/comments`,
       "POST",
       { comment: content }
     );
+
+    if (minimal) {
+      // API may return { comments: [...] } or direct comment object
+      const comment = data.comments?.[0] || data.comment || data;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              id: comment.id || comment.comment_id,
+              created_time: comment.created_time,
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
     return {
       content: [
         {
