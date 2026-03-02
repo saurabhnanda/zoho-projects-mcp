@@ -9,6 +9,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import "dotenv/config";
+import { RateLimiter } from "./rate-limiter.js";
 
 interface ZohoConfig {
   accessToken: string;
@@ -25,6 +26,7 @@ class ZohoProjectsServer {
   private config: ZohoConfig;
   private baseUrl: string = "https://projectsapi.zoho.com/api/v3";
   private tokenExpiresAt: number = 0; // Unix timestamp in milliseconds
+  private rateLimiter: RateLimiter;
 
   constructor() {
     this.server = new Server(
@@ -56,6 +58,10 @@ class ZohoProjectsServer {
 
     // If no access token provided, set expiration to 0 to force immediate refresh
     this.tokenExpiresAt = this.config.accessToken ? Date.now() + 3600 * 1000 : 0;
+
+    const rateLimitMax = parseInt(process.env.ZOHO_RATE_LIMIT_MAX || "100", 10);
+    const rateLimitWindowSec = parseInt(process.env.ZOHO_RATE_LIMIT_WINDOW || "120", 10);
+    this.rateLimiter = new RateLimiter(rateLimitMax, rateLimitWindowSec * 1000);
 
     this.setupHandlers();
   }
@@ -149,10 +155,20 @@ class ZohoProjectsServer {
       options.body = JSON.stringify(body);
     }
 
+    await this.rateLimiter.acquire();
     const response = await fetch(url, options);
 
     if (!response.ok) {
       const errorText = await response.text();
+
+      // If 429 rate limited, wait and retry once
+      if (response.status === 429 && !isRetry) {
+        const retryAfter = response.headers.get("Retry-After");
+        const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 60_000;
+        console.error(`Received 429. Waiting ${waitMs}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return await this.makeRequest(endpoint, method, body, true, useRestApi);
+      }
 
       // If 401 and we have refresh credentials and haven't retried yet, try refresh
       if (response.status === 401 && !isRetry &&
@@ -307,6 +323,11 @@ class ZohoProjectsServer {
                 type: "string",
                 description: "Sort criteria in format ASC(field) or DESC(field). Fields: last_modified_time, created_time. Example: DESC(last_modified_time)",
               },
+              minimal: {
+                type: "boolean",
+                description: "Return minimal response (id, name, status, priority, created_time, last_updated_time). Default: true",
+                default: true,
+              },
             },
           },
         },
@@ -318,6 +339,11 @@ class ZohoProjectsServer {
             properties: {
               project_id: { type: "string", description: "Project ID" },
               task_id: { type: "string", description: "Task ID" },
+              minimal: {
+                type: "boolean",
+                description: "Return minimal response (id, name, status, priority, created_time, last_updated_time). Default: true",
+                default: true,
+              },
             },
             required: ["project_id", "task_id"],
           },
@@ -531,6 +557,11 @@ class ZohoProjectsServer {
                 description: "Items per page",
                 default: 10,
               },
+              minimal: {
+                type: "boolean",
+                description: "Return minimal response (entity_id, title/name only). Default: true",
+                default: true,
+              },
             },
             required: ["search_term"],
           },
@@ -624,7 +655,7 @@ class ZohoProjectsServer {
         // Task Comments
         {
           name: "list_task_comments",
-          description: "List all comments on a task. Even with minimal=true, attachment IDs are included so you can call download_comment_attachment if needed.",
+          description: "List all comments on a task. IMPORTANT: Always use minimal=true (default) - it includes all needed info including attachment IDs for downloads. Only use minimal=false if you have a specific reason.",
           inputSchema: {
             type: "object",
             properties: {
@@ -632,7 +663,7 @@ class ZohoProjectsServer {
               task_id: { type: "string", description: "Task ID" },
               minimal: {
                 type: "boolean",
-                description: "Return minimal response (id, created_time, author, comment, attachments[{id,name,type}]). Includes enough info to fetch attachments via download_comment_attachment. Set to false for full response. Default: true",
+                description: "STRONGLY RECOMMENDED: Keep as true. Returns (id, created_time, author, comment, attachments[{id,name,type}]) - sufficient for all common operations including attachment downloads. Only set to false if you need additional metadata. Default: true",
                 default: true
               },
               since: {
@@ -776,7 +807,7 @@ class ZohoProjectsServer {
               },
               minimal: {
                 type: "boolean",
-                description: "Return minimal response (id, key, name, status, priority, has_comments, created_time, last_updated_time). Set to false for full response. Default: true",
+                description: "Return minimal response (id, key, name, status, priority, owners[{name,email}], has_comments, created_time, last_updated_time). Set to false for full response. Default: true",
                 default: true,
               },
               has_comments: {
@@ -823,9 +854,9 @@ class ZohoProjectsServer {
 
           // Task operations
           case "list_tasks":
-            return await this.listTasks(params.project_id, params.page, params.per_page, params.sort_by);
+            return await this.listTasks(params.project_id, params.page, params.per_page, params.sort_by, params.minimal !== false);
           case "get_task":
-            return await this.getTask(params.project_id, params.task_id);
+            return await this.getTask(params.project_id, params.task_id, params.minimal !== false);
           case "create_task":
             return await this.createTask(params);
           case "update_task":
@@ -851,7 +882,7 @@ class ZohoProjectsServer {
 
           // Search
           case "search":
-            return await this.search(params);
+            return await this.search(params, params.minimal !== false);
 
           // Users
           case "list_users":
@@ -1007,7 +1038,8 @@ class ZohoProjectsServer {
     projectId?: string,
     page: number = 1,
     perPage: number = 10,
-    sortBy?: string
+    sortBy?: string,
+    minimal: boolean = true
   ) {
     let queryParams = `page=${page}&per_page=${perPage}`;
     if (sortBy) queryParams += `&sort_by=${encodeURIComponent(sortBy)}`;
@@ -1016,15 +1048,47 @@ class ZohoProjectsServer {
       ? `/portal/${this.config.portalId}/projects/${projectId}/tasks?${queryParams}`
       : `/portal/${this.config.portalId}/tasks?${queryParams}`;
     const data = await this.makeRequest(endpoint);
+
+    if (minimal) {
+      const tasks = data.tasks || [];
+      const minimalTasks = tasks.map((t: any) => ({
+        id: t.id_string || t.id,
+        name: t.name,
+        status: t.status?.name,
+        priority: t.priority,
+        created_time: t.created_time,
+        last_updated_time: t.last_updated_time,
+      }));
+      return {
+        content: [{ type: "text", text: JSON.stringify({ tasks: minimalTasks }, null, 2) }],
+      };
+    }
+
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     };
   }
 
-  private async getTask(projectId: string, taskId: string) {
+  private async getTask(projectId: string, taskId: string, minimal: boolean = true) {
     const data = await this.makeRequest(
       `/portal/${this.config.portalId}/projects/${projectId}/tasks/${taskId}`
     );
+
+    if (minimal) {
+      const t = data.tasks?.[0] || data;
+      const minimalTask = {
+        id: t.id_string || t.id,
+        name: t.name,
+        status: t.status?.name,
+        priority: t.priority,
+        created_time: t.created_time,
+        last_updated_time: t.last_updated_time,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(minimalTask, null, 2) }],
+      };
+    }
+
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     };
@@ -1173,12 +1237,25 @@ class ZohoProjectsServer {
   }
 
   // Search
-  private async search(params: any) {
+  private async search(params: any, minimal: boolean = true) {
     const { search_term, project_id, module = "all", page = 1, per_page = 10 } = params;
     const endpoint = project_id
       ? `/portal/${this.config.portalId}/projects/${project_id}/search?search_term=${encodeURIComponent(search_term)}&module=${module}&page=${page}&per_page=${per_page}`
       : `/portal/${this.config.portalId}/search?search_term=${encodeURIComponent(search_term)}&module=${module}&status=active&page=${page}&per_page=${per_page}`;
     const data = await this.makeRequest(endpoint);
+
+    if (minimal) {
+      const results = data.search_result || data.results || [];
+      const minimalResults = results.map((r: any) => ({
+        entity_id: r.entity_id || r.id,
+        title: r.title || r.name,
+        module: r.module,
+      }));
+      return {
+        content: [{ type: "text", text: JSON.stringify({ results: minimalResults }, null, 2) }],
+      };
+    }
+
     return {
       content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     };
@@ -1707,6 +1784,10 @@ class ZohoProjectsServer {
         name: t.name,
         status: t.status?.name,
         priority: t.priority,
+        owners: (t.details?.owners || []).map((o: any) => ({
+          name: o.full_name || o.name,
+          email: o.email,
+        })),
         has_comments: t.is_comment_added || false,
         created_time: t.created_time_format,
         last_updated_time: t.last_updated_time_format,

@@ -12,6 +12,7 @@ import express from "express";
 import cors from "cors";
 import { randomUUID } from "node:crypto";
 import "dotenv/config";
+import { RateLimiter } from "./rate-limiter.js";
 
 interface ZohoConfig {
   accessToken: string;
@@ -28,6 +29,7 @@ class ZohoProjectsServer {
   private config: ZohoConfig;
   private baseUrl: string = "https://projectsapi.zoho.com/api/v3";
   private tokenExpiresAt: number = 0; // Unix timestamp in milliseconds
+  private rateLimiter: RateLimiter;
 
   constructor() {
     this.server = new Server(
@@ -59,6 +61,10 @@ class ZohoProjectsServer {
 
     // Set initial token expiration (assume current token expires in 1 hour if not known)
     this.tokenExpiresAt = Date.now() + 3600 * 1000;
+
+    const rateLimitMax = parseInt(process.env.ZOHO_RATE_LIMIT_MAX || "100", 10);
+    const rateLimitWindowSec = parseInt(process.env.ZOHO_RATE_LIMIT_WINDOW || "120", 10);
+    this.rateLimiter = new RateLimiter(rateLimitMax, rateLimitWindowSec * 1000);
 
     this.setupHandlers();
   }
@@ -147,10 +153,20 @@ class ZohoProjectsServer {
       options.body = JSON.stringify(body);
     }
 
+    await this.rateLimiter.acquire();
     const response = await fetch(url, options);
 
     if (!response.ok) {
       const errorText = await response.text();
+
+      // If 429 rate limited, wait and retry once
+      if (response.status === 429 && !isRetry) {
+        const retryAfter = response.headers.get("Retry-After");
+        const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 60_000;
+        console.error(`Received 429. Waiting ${waitMs}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return await this.makeRequest(endpoint, method, body, true);
+      }
 
       // If 401 and we have refresh credentials and haven't retried yet, try refresh
       if (response.status === 401 && !isRetry &&
