@@ -368,9 +368,9 @@ class ZohoProjectsServer {
                 description: "Start date (YYYY-MM-DD)",
               },
               end_date: { type: "string", description: "End date (YYYY-MM-DD)" },
-              assignee_zpuid: {
+              assignee_zuid: {
                 type: "string",
-                description: "Assignee user ZPUID",
+                description: "Assignee user ZUID (global Zoho user ID — the 'zuid' field from list_users response). Comma-separate for multiple owners.",
               },
             },
             required: ["project_id", "name"],
@@ -396,6 +396,10 @@ class ZohoProjectsServer {
                 description: "Start date (YYYY-MM-DD)",
               },
               end_date: { type: "string", description: "End date (YYYY-MM-DD)" },
+              assignee_zuid: {
+                type: "string",
+                description: "Assignee user ZUID (global Zoho user ID — the 'zuid' field from list_users response). Comma-separate for multiple owners.",
+              },
             },
             required: ["project_id", "task_id"],
           },
@@ -1095,10 +1099,16 @@ class ZohoProjectsServer {
   }
 
   private async createTask(params: any) {
-    const { project_id, tasklist_id, ...taskData } = params;
+    const { project_id, tasklist_id, assignee_zuid, ...taskData } = params;
     // Zoho API expects 'tasklist' field, not 'tasklist_id'
     if (tasklist_id) {
       taskData.tasklist = { id: tasklist_id };
+    }
+    // v3 API assigns owners via owners_and_work.owners[{zuid}] (comma-separated for multiple)
+    if (assignee_zuid) {
+      taskData.owners_and_work = {
+        owners: String(assignee_zuid).split(",").map((z: string) => ({ zuid: z.trim() })),
+      };
     }
     const data = await this.makeRequest(
       `/portal/${this.config.portalId}/projects/${project_id}/tasks`,
@@ -1116,7 +1126,13 @@ class ZohoProjectsServer {
   }
 
   private async updateTask(params: any) {
-    const { project_id, task_id, ...taskData } = params;
+    const { project_id, task_id, assignee_zuid, ...taskData } = params;
+    // v3 API assigns owners via owners_and_work.owners[{zuid}] (comma-separated for multiple)
+    if (assignee_zuid) {
+      taskData.owners_and_work = {
+        owners: String(assignee_zuid).split(",").map((z: string) => ({ zuid: z.trim() })),
+      };
+    }
     const data = await this.makeRequest(
       `/portal/${this.config.portalId}/projects/${project_id}/tasks/${task_id}`,
       "PATCH",
